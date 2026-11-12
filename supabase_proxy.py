@@ -10,8 +10,16 @@
   3. 长期持有期间不换号，只在租约快到时续租（renew_proxy 只推
      lease_until，不领新号）。进程退出由 atexit 统一归还，不锁死池。
 
-去重仍然由服务端 FOR UPDATE SKIP LOCKED 保证：并发 worker 领到的
-必然是不同出口，跨 job / 跨仓库也一样。
+去重由服务端 FOR UPDATE SKIP LOCKED 保证：并发 worker 领到的必然是
+不同出口，跨 job / 跨仓库也一样。
+
+线程退出回收（2026-11-12 实测修复）：
+  采集器在 G1 探测 / 切分 / 翻页等阶段各自 new 一个 ThreadPoolExecutor，
+  线程池销毁时 threading.local 数据随线程消失，但没有任何归还钩子，
+  它持有的出口会一直挂在 leased 直到租约到期；CPython 还会复用线程 ID，
+  表现为「同一个 worker 名下挂着多个租约」。不修的话池会被逐步占满。
+  这里用 _holders 记录 (ident -> 出口/线程对象)，在 get() 里按 5 秒节流
+  回收 is_alive()==False 的线程持有的出口。绝大多数 get() 仍是纯本地返回。
 """
 import atexit
 import json
@@ -25,6 +33,7 @@ _BASE = os.environ.get(
 _KEY = os.environ.get('SUPABASE_ANON_KEY', '')
 _LEASE = int(os.environ.get('PROXY_LEASE_SECONDS', '1800'))
 _RENEW_AFTER = int(os.environ.get('PROXY_RENEW_AFTER', '1500'))
+_REAP_EVERY = 5.0
 _PREFIX = os.environ.get('WORKER_ID', 'local')
 
 _H = {
@@ -51,9 +60,12 @@ class LeasePool:
         self._local = threading.local()
         self._all = set()
         self._lock = threading.Lock()
-        self.claims = 0        # 领新号次数（含首次）
-        self.rotates = 0       # 因失效换号次数
-        self.renews = 0        # 续租次数（不换号）
+        self._holders = {}        # ident -> {'ep', 'thread'}
+        self._last_reap = 0.0
+        self.claims = 0          # 领新号次数（含首次）
+        self.rotates = 0         # 因失效换号次数
+        self.renews = 0          # 续租次数（不换号）
+        self.reaped = 0          # 回收已退出线程的出口数
         atexit.register(self.close)
 
     def _worker(self):
@@ -62,6 +74,24 @@ class LeasePool:
             w = '%s-t%d' % (_PREFIX, threading.get_ident())
             self._local.worker = w
         return w
+
+    def _reap(self):
+        """归还已退出线程遗留的出口。只在节流点执行，正常路径不碰接口。
+
+        用线程对象身份而不是 get_ident()：CPython 会复用已销毁线程的 ident，
+        按 ident 排除「自己」会漏掉恰好复用同一 ident 的旧线程登记。
+        """
+        me = threading.current_thread()
+        to_free = []
+        with self._lock:
+            for ident, h in list(self._holders.items()):
+                if h['thread'] is not me and not h['thread'].is_alive():
+                    to_free.append(h['ep'])
+                    del self._holders[ident]
+                    self._all.discard(h['ep'])
+        for ep in to_free:
+            self.release(ep, True)
+            self.reaped += 1
 
     def _claim(self):
         rows = _rpc('claim_proxy', {
@@ -74,21 +104,28 @@ class LeasePool:
         self.claims += 1
         with self._lock:
             self._all.add(ep)
+            self._holders[threading.get_ident()] = {
+                'ep': ep, 'thread': threading.current_thread()}
         return ep
 
     def get(self):
         """返回当前持有的出口。首次调用才领，之后直接复用。"""
+        now = time.time()
+        if now - self._last_reap >= _REAP_EVERY:
+            self._last_reap = now
+            self._reap()
+
         cur = getattr(self._local, 'current', None)
         if cur is None:
             cur = self._claim()
             if cur is None:
                 return None          # 池暂时空，调用方稍等重试
             self._local.current = cur
-            self._local.since = time.time()
+            self._local.since = now
             return cur
         # 持有时间到阈值：只续租，不换号、不领新号。
         # 纯本地计时判断，绝大多数 get() 调用不碰 Supabase 接口。
-        if time.time() - self._local.since >= _RENEW_AFTER:
+        if now - self._local.since >= _RENEW_AFTER:
             try:
                 ok = _rpc('renew_proxy', {
                     'p_endpoint': cur, 'p_worker': self._worker(),
@@ -98,7 +135,7 @@ class LeasePool:
             except Exception as e:
                 ok = None
                 print('[pool] renew 异常: %s' % e, flush=True)
-            self._local.since = time.time()
+            self._local.since = now
             if ok is not True:       # 租约已被回收，换一个继续用
                 return self.rotate(ok=True)
         return cur
@@ -115,6 +152,7 @@ class LeasePool:
         with self._lock:
             if old:
                 self._all.discard(old)
+                self._holders.pop(threading.get_ident(), None)
         self.rotates += 1
         try:
             new = self.get()
@@ -124,7 +162,8 @@ class LeasePool:
         return new
 
     def release(self, endpoint, ok=True):
-        """归还。ok=False 让服务端累计 fail_count，连续 3 次标 dead。"""
+        """归还。ok=False 让服务端累计 fail_count、新鲜度回退 1 小时
+        （否则 LIFO 会把坏号一直排在队首），连续 3 次标 dead。"""
         try:
             _rpc('release_proxy', {'p_endpoint': endpoint, 'p_ok': bool(ok)})
         except Exception as e:
@@ -141,10 +180,12 @@ class LeasePool:
         with self._lock:
             eps = list(self._all)
             self._all.clear()
+            self._holders.clear()
         for ep in eps:
             self.release(ep, True)
-        print('[pool] 退出归还 %d 个出口 | 领取 %d / 换号 %d / 续租 %d'
-              % (len(eps), self.claims, self.rotates, self.renews), flush=True)
+        print('[pool] 退出归还 %d 个出口 | 领取 %d / 换号 %d / 续租 %d / 回收死线程 %d'
+              % (len(eps), self.claims, self.rotates, self.renews, self.reaped),
+              flush=True)
 
 
 _POOL = None
