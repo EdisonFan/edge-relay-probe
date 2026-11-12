@@ -104,15 +104,24 @@ class LeasePool:
         return cur
 
     def rotate(self, ok=True):
-        """当前号不能用了：归还它并立即领一个新号，之后继续长期持有。"""
+        """当前号不能用了：先领新号，再归还旧号，之后继续长期持有。
+
+        顺序不能反：若先归还，LIFO 按 last_ok_at/id 排序会把刚放掉的那个
+        号当成最「新鲜」的立刻再发给同一个 worker，等于没换（实测复现）。
+        旧号在领取瞬间仍是 leased，claim_proxy 不会选中它。
+        """
         old = getattr(self._local, 'current', None)
-        if old:
-            self.release(old, ok)
-            with self._lock:
-                self._all.discard(old)
         self._local.current = None
+        with self._lock:
+            if old:
+                self._all.discard(old)
         self.rotates += 1
-        return self.get()
+        try:
+            new = self.get()
+        finally:
+            if old:
+                self.release(old, ok)
+        return new
 
     def release(self, endpoint, ok=True):
         """归还。ok=False 让服务端累计 fail_count，连续 3 次标 dead。"""
@@ -126,6 +135,9 @@ class LeasePool:
         return self.get()
 
     def close(self):
+        if getattr(self, '_closed', False):
+            return
+        self._closed = True
         with self._lock:
             eps = list(self._all)
             self._all.clear()
