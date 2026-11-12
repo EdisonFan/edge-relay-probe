@@ -1,0 +1,46 @@
+name: Notify gk-collect to pick up results
+
+# 采集批次一结束就通知主仓转运。用 workflow_run（事件监听）而不是
+# 在 bench.yml 里加 needs 链：GitHub 在 run 启动时锁定工作流定义，
+# 改 needs 只对之后新启动的批次生效。
+#
+# 跨仓派发不能用仓库自带的 GITHUB_TOKEN（实测 403
+# Resource not accessible by integration），所以用 LAB_DISPATCH_TOKEN。
+
+on:
+  workflow_run:
+    workflows: ["bench"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 派发主仓转运工作流
+        shell: bash
+        env:
+          PAT: ${{ secrets.LAB_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "未配置 LAB_DISPATCH_TOKEN，跳过（主仓事件驱动兜底）"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/dispatch.json -w '%{http_code}' --max-time 30 \
+            -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d '{"ref":"main"}' \
+            "https://api.github.com/repos/EdisonFan/gk-collect/actions/workflows/sync-from-lab.yml/dispatches")
+          echo "dispatch HTTP $code"
+          if [ "$code" != "204" ]; then
+            cat /tmp/dispatch.json
+            exit 1
+          fi
+          echo "已派发主仓 sync-from-lab.yml"
