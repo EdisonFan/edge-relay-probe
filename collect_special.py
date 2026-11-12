@@ -152,12 +152,12 @@ DEAD_THRESHOLD = 6                 # v1.2：3 次太激进，慢代理被误判�
 THROTTLE_FAILS = {}                # proxy -> 连续 1069/1074 次数
 THROTTLE_DEAD_THRESHOLD = 5        # v1.2：限流号判死放宽，减少误伤可用号
 
-# ---- v6：代理改为 Supabase 按需领取（每用一个取一个，绝不取重）----
+# ---- v7：代理改为 Supabase 持有复用（第一次取，坏了才换）----
 # 原实现启动时一次性读入 proxies_cnb.txt 全量池，之后按 (tag+idx)%n 轮换。
-# 现在每次 HTTP 请求前经 POOL.acquire() 从 Supabase 原子领一个出口，
-# 用完 POOL.release() 归还；claim_proxy 的 FOR UPDATE SKIP LOCKED 保证
-# 并发 worker 不会领到同一个出口。业务成功才置 ok=True，其余置 False
-# 让服务端累计劣迹、连续 3 次标 dead；pool-keeper 每 2 小时 upsert 复活。
+# 现在每个 worker 线程首次用代理时经 POOL.get() 领一个，之后一直复用；
+# 连接失败/限流/异常业务码才 POOL.rotate() 归还并领新号。
+# 领取按逆时间倒序（last_ok_at DESC, id DESC）保证取到最新鲜的出口；
+# SKIP LOCKED 保证并发不取重；长期持有靠 renew_proxy 续租、atexit 归还。
 from supabase_proxy import get_pool
 POOL = get_pool()
 
@@ -201,79 +201,79 @@ def call(proxy, page, extra):
 
 def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0,
                  size_hint=None):
-    """严格查询：每发一个请求前从 Supabase 原子领一个出口，用完即归还。
+    """严格查询：worker 持有的出口一直用，发现不能用了才换。
 
-    与 v5.3 的唯一区别是选号方式：不再预加载 proxies_cnb.txt 并按
-    (tag+idx)%n 轮询，改为「每用一个取一个」。claim_proxy 用
-    FOR UPDATE SKIP LOCKED 领取，并发 worker 拿到的必然是不同行；
-    release_proxy 归还时 ok=False 会让服务端累计 fail_count、连续 3 次
-    标 dead，池因此自净，不再需要 job 内的全池复活逻辑。
+    与 v6（每次请求领+还）的区别：POOL.get() 只在首次调用时领一个出口，
+    之后一直复用；连接失败、限流、异常业务码才 POOL.rotate() 归还旧号并
+    立即领新号。合法完整响应与 1090（与代理无关）都不换号。
 
-    proxies 参数保留仅为兼容下游 20 余处调用链，不再参与选号。
+    领取顺序由服务端保证：last_ok_at DESC NULLS LAST, id DESC，
+    即逆时间倒序 / 后进先出，优先拿最新鲜的出口。
+    SKIP LOCKED 保证并发 worker 不会领到同一个出口。
+
+    proxies 参数保留仅为兼容下游调用链，不再参与选号。
     """
     used_size = int(size_hint or extra.get('size') or SIZE)
     extra = dict(extra)
     extra['size'] = used_size
-    # 领号上限：QUERY_ROUNDS 计「真正拨出去」的次数，另留 2 倍额度给
-    # 「领到本 job 判死的号」和「池暂时被租空」这两种不占额度的情况。
-    max_claims = QUERY_ROUNDS * 3
-    tried, claims = 0, 0
-    while tried < QUERY_ROUNDS and claims < max_claims:
-        px = POOL.acquire()
-        claims += 1
+    max_rounds = QUERY_ROUNDS * 2
+    tried, rnd = 0, 0
+    while tried < QUERY_ROUNDS and rnd < max_rounds:
+        px = POOL.get()              # 首次领取，之后复用；到点自动续租
+        rnd += 1
         if px is None:
-            time.sleep(1.0)          # 号全在租约中，稍等再领
+            time.sleep(1.0)          # 池暂时空，稍等再试
             continue
         if px in DEAD_PROXIES:
-            POOL.release(px, True)   # 本 job 判死的号原样还回，服务端另行淘汰
-            continue
-        tried += 1
-        lease_ok = False
-        try:
-            try:
-                d = call(px, page, extra)
-            except Exception:
-                with lock:
-                    stats['conn_err'] += 1
-                    CONN_FAILS[px] = CONN_FAILS.get(px, 0) + 1
-                    if CONN_FAILS[px] >= DEAD_THRESHOLD:
-                        DEAD_PROXIES.add(px)
+            # 本 job 判过的号：号本身没问题，原样还回并换一个继续用
+            px = POOL.rotate(ok=True)
+            if px is None:
                 continue
-            code, dat = str(d.get('code')), d.get('data')
-            if code == '0000' and isinstance(dat, dict):
-                it = dat.get('item') or []
-                if len(it) < min_items:
-                    with lock:
-                        stats['short_page'] += 1
-                        CONN_FAILS.pop(px, None)
-                        THROTTLE_FAILS.pop(px, None)
-                    lease_ok = True      # 号是通的，只是页残缺
-                    continue
+        tried += 1
+        try:
+            d = call(px, page, extra)
+        except Exception:
+            with lock:
+                stats['conn_err'] += 1
+                CONN_FAILS[px] = CONN_FAILS.get(px, 0) + 1
+                if CONN_FAILS[px] >= DEAD_THRESHOLD:
+                    DEAD_PROXIES.add(px)
+            POOL.rotate(ok=False)    # 连不上：标劣迹 + 领新号
+            continue
+        code, dat = str(d.get('code')), d.get('data')
+        if code == '0000' and isinstance(dat, dict):
+            it = dat.get('item') or []
+            if len(it) < min_items:
                 with lock:
-                    stats['ok'] += 1
+                    stats['short_page'] += 1
                     CONN_FAILS.pop(px, None)
                     THROTTLE_FAILS.pop(px, None)
-                lease_ok = True
-                return it, dat.get('numFound'), True, '0000', used_size
+                # 号是通的，只是页残缺：还回池（不算劣迹）换一个继续用
+                POOL.rotate(ok=True)
+                continue
             with lock:
-                thr = code in ('1069', '1074')
-                stats['throttled' if thr else 'other'] += 1
+                stats['ok'] += 1
                 CONN_FAILS.pop(px, None)
-                if thr:
-                    THROTTLE_FAILS[px] = THROTTLE_FAILS.get(px, 0) + 1
-                    if THROTTLE_FAILS[px] >= THROTTLE_DEAD_THRESHOLD:
-                        DEAD_PROXIES.add(px)
-                else:
-                    THROTTLE_FAILS.pop(px, None)
-            if code == '1090':
-                with lock:
-                    stats['oversize'] = stats.get('oversize', 0) + 1
-                lease_ok = True        # 1090 与代理无关，不牵连号
-                return [], None, False, '1090', used_size
-            if code == '1069':
-                time.sleep(0.25)
-        finally:
-            POOL.release(px, lease_ok)
+                THROTTLE_FAILS.pop(px, None)
+            return it, dat.get('numFound'), True, '0000', used_size
+        with lock:
+            thr = code in ('1069', '1074')
+            stats['throttled' if thr else 'other'] += 1
+            CONN_FAILS.pop(px, None)
+            if thr:
+                THROTTLE_FAILS[px] = THROTTLE_FAILS.get(px, 0) + 1
+                if THROTTLE_FAILS[px] >= THROTTLE_DEAD_THRESHOLD:
+                    DEAD_PROXIES.add(px)
+            else:
+                THROTTLE_FAILS.pop(px, None)
+        if code == '1090':
+            with lock:
+                stats['oversize'] = stats.get('oversize', 0) + 1
+            # 1090 与代理无关，换号没用，保持持有
+            return [], None, False, '1090', used_size
+        POOL.rotate(ok=False)        # 限流 / 异常业务码：换号
+        if code == '1069':
+            time.sleep(0.25)
     with lock:
         stats['query_failed'] += 1
     return [], None, False, None, used_size
@@ -721,11 +721,11 @@ def main():
     CONN_FAILS.clear()
     THROTTLE_FAILS.clear()
     random.seed('v5-%s-%s' % (PROV, YEAR))
-    # 代理不再预加载：每次请求由 query_strict 经 POOL 从 Supabase 原子领取。
-    # 启动自检「领一个立刻归还」，池或凭证不可用直接失败，绝不退化为直连。
+    # 第一次取：领一个出口由主线程持有，之后各 worker 线程各自领一个长期复用。
+    # 池或凭证不可用直接失败，绝不退化为直连；退出时 atexit 统一归还。
     proxies = []               # 仅为兼容下游调用链保留，不参与选号
-    selfcheck = POOL.selfcheck()
-    if not selfcheck:
+    warm = POOL.warmup()
+    if not warm:
         print('::error::Supabase 代理池不可用，拒绝直连，任务终止', flush=True)
         raise SystemExit(1)
     lock = threading.Lock()
@@ -735,8 +735,8 @@ def main():
              'oversize': 0}  # 1090：响应体超长次数（size 自适应降级触发）
     t0 = time.time()
     os.makedirs('out', exist_ok=True)
-    print('=== v6 零丢失采集 PROV=%s YEAR=%s 代理=Supabase按需领取(自检%s) 并发=%d ===' %
-          (PROV, YEAR, selfcheck, WORKERS), flush=True)
+    print('=== v7 零丢失采集 PROV=%s YEAR=%s 代理=Supabase持有复用(首次%s/LIFO) 并发=%d ===' %
+          (PROV, YEAR, warm, WORKERS), flush=True)
 
     # 上轮结果作为增量基础（闸门未过时重派，已采数据累积不丢）
     prev_items = []
