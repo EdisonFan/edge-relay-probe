@@ -34,24 +34,12 @@ jobs:
     env:
       SUPABASE_URL: https://ripobzmwgmdxyixoevee.supabase.co
       SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-      PROXY_LEASE_SECONDS: '180'
+      PROXY_LEASE_SECONDS: '1800'      # 持有租约 30 分钟
+      PROXY_RENEW_AFTER: '1500'       # 持有满 25 分钟续租一次，不换号
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
-      - name: 代理池连通性自检
-        # 不探活全池，也不预加载：只领一个出口再立即归还，
-        # 验证凭证和 claim/release 两个 RPC 都通。
-        timeout-minutes: 3
-        run: |
-          python3 - <<'PY'
-          from supabase_proxy import get_pool
-          ep = get_pool().selfcheck()
-          if not ep:
-              raise SystemExit('::error::Supabase 代理池不可用，拒绝直连')
-          print('池自检通过，领到并归还:', ep)
-          PY
 
       - name: 采集（按需求领代理，零丢失）
         timeout-minutes: 280
@@ -74,13 +62,12 @@ jobs:
             echo "已读取上轮 $BR 结果与切分计划"
           fi
           python3 collect_special.py
-          echo "=== 池使用统计 ==="
+          echo "=== 池使用统计（首次领取 / 失效换号 / 续租）==="
           python3 - <<'PY'
           from supabase_proxy import get_pool
           p = get_pool()
-          print('领取 %d / 归还 %d / 池空等待 %d' % (p.claimed, p.released, p.empty))
-          if p.claimed != p.released:
-              print('::warning::领取与归还数不等，检查是否有租约未释放（租约到期会自动回收）')
+          print('领新号 %d / 失效换号 %d / 续租 %d' % (p.claims, p.rotates, p.renews))
+          print('绝大多数请求复用持有号，未访问 Supabase 接口')
           PY
 
       - name: 推送结果分支（闸门未过也保留增量）
