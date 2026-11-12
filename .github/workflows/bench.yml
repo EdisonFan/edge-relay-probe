@@ -1,0 +1,168 @@
+name: bench
+run-name: "bench ${{ inputs.tag }}"
+
+# 第三采集通道：代理不预加载，每发一个请求才从 Supabase 代理池原子领一个出口。
+# 结果分支 special-* 先推回本仓，再由 notify 工作流派发主仓 sync-from-lab.yml
+# 统一回收（主仓是唯一真源，负责达标统计与 CNB 1:1 镜像）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      combos:
+        description: 'JSON array of "prov-year"'
+        required: true
+        type: string
+        default: '["13-2025"]'
+      tag:
+        description: '批次标签，便于日志识别'
+        required: false
+        type: string
+        default: 'manual'
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        combo: ${{ fromJSON(inputs.combos) }}
+    env:
+      SUPABASE_URL: https://ripobzmwgmdxyixoevee.supabase.co
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      PROXY_LEASE_SECONDS: '180'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 代理池连通性自检
+        # 不探活全池，也不预加载：只领一个出口再立即归还，
+        # 验证凭证和 claim/release 两个 RPC 都通。
+        timeout-minutes: 3
+        run: |
+          python3 - <<'PY'
+          from supabase_proxy import get_pool
+          ep = get_pool().selfcheck()
+          if not ep:
+              raise SystemExit('::error::Supabase 代理池不可用，拒绝直连')
+          print('池自检通过，领到并归还:', ep)
+          PY
+
+      - name: 采集（按需求领代理，零丢失）
+        timeout-minutes: 280
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          PROV="${COMBO%%-*}"
+          YEAR="${COMBO##*-}"
+          export PROV YEAR
+          # worker_id 含 repo-run-attempt-combo，池侧再加线程号，全局唯一
+          export WORKER_ID="${GITHUB_REPOSITORY}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${COMBO}"
+          echo "=== special $PROV-$YEAR ==="
+          mkdir -p out
+          BR="special-${PROV}-${YEAR}"
+          if git fetch -q --depth=1 origin "refs/heads/${BR}" 2>/dev/null; then
+            git show "FETCH_HEAD:out/special_${PROV}_${YEAR}.json" > out/prev.json 2>/dev/null || rm -f out/prev.json
+            git show "FETCH_HEAD:out/plan_${PROV}_${YEAR}.json" > out/partition_plan_prev.json 2>/dev/null || rm -f out/partition_plan_prev.json
+            echo "已读取上轮 $BR 结果与切分计划"
+          fi
+          python3 collect_special.py
+          echo "=== 池使用统计 ==="
+          python3 - <<'PY'
+          from supabase_proxy import get_pool
+          p = get_pool()
+          print('领取 %d / 归还 %d / 池空等待 %d' % (p.claimed, p.released, p.empty))
+          if p.claimed != p.released:
+              print('::warning::领取与归还数不等，检查是否有租约未释放（租约到期会自动回收）')
+          PY
+
+      - name: 推送结果分支（闸门未过也保留增量）
+        if: always()
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          PROV="${COMBO%%-*}"
+          YEAR="${COMBO##*-}"
+          BR="special-${PROV}-${YEAR}"
+          F="out/special_${PROV}_${YEAR}.json"
+          PLAN="out/plan_${PROV}_${YEAR}.json"
+          if [ -s out/partition_plan.json ]; then
+            cp out/partition_plan.json "$PLAN"
+          fi
+          git config user.email "gk-collect@users.noreply.github.com"
+          git config user.name "gk-collect"
+          git checkout -B "$BR"
+          PUSHED=""
+          if [ -s "$F" ]; then
+            GP=$(python3 -c "import json;print(json.load(open('$F')).get('gate_pass', False))")
+            OLD_GP="False"
+            if [ -s out/prev.json ]; then
+              OLD_GP=$(python3 -c "import json;print(json.load(open('out/prev.json')).get('gate_pass', False))" 2>/dev/null || echo False)
+            fi
+            if [ "$GP" = "False" ] && [ "$OLD_GP" = "True" ]; then
+              echo "新结果闸门未过，云端已有达标结果，跳过结果推送避免降级"
+            else
+              git add -f "$F"
+              PUSHED="result(gate_pass=${GP})"
+            fi
+          else
+            echo "本轮无结果文件（采集未完成/超时），仅推送切分计划"
+          fi
+          if [ -s "$PLAN" ]; then
+            git add -f "$PLAN"
+            PUSHED="${PUSHED:+$PUSHED }plan"
+          fi
+          if [ -z "$PUSHED" ]; then
+            echo "无结果也无计划，跳过推送，云端旧结果不变"
+            rm -f out/prev.json
+            exit 0
+          fi
+          git commit -m "dataset ${PROV}-${YEAR} ${PUSHED}" || echo "无变更"
+          git push -f origin "HEAD:refs/heads/${BR}"
+          echo "已推送 $BR (${PUSHED})"
+          rm -f out/prev.json
+
+      - name: 上传结果制品
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: res-${{ matrix.combo }}
+          path: out/special_*.json
+          if-no-files-found: ignore
+          retention-days: 90
+          overwrite: true
+
+      - name: 闸门校验（未全过则判失败，触发重派）
+        if: always()
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          F="out/special_${COMBO%%-*}_${COMBO##*-}.json"
+          if [ ! -s "$F" ]; then
+            echo "::error::${COMBO} 无结果文件（采集未完成或 G1 未取到），判失败待重派"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, sys
+          prov, year = os.environ['COMBO'].split('-', 1)
+          d = json.load(open('out/special_%s_%s.json' % (prov, year)))
+          print('闸门明细:', json.dumps(d.get('gate'), ensure_ascii=False))
+          print('numFound=%s count=%s partition_count=%s gate_pass=%s' %
+                (d.get('num_found'), d.get('count'), d.get('partition_count'),
+                 d.get('gate_pass')))
+          if not d.get('gate_pass'):
+              print('::error::%s-%s 闸门未全过，判失败待重派' % (prov, year))
+              sys.exit(1)
+          print('%s-%s 零丢失达标：count == numFound' % (prov, year))
+          PY
