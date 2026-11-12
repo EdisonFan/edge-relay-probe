@@ -66,7 +66,8 @@ jobs:
           python3 - <<'PY'
           from supabase_proxy import get_pool
           p = get_pool()
-          print('领新号 %d / 失效换号 %d / 续租 %d' % (p.claims, p.rotates, p.renews))
+          print('领新号 %d / 失效换号 %d / 续租 %d / 回收死线程 %d' %
+                (p.claims, p.rotates, p.renews, p.reaped))
           print('绝大多数请求复用持有号，未访问 Supabase 接口')
           PY
 
