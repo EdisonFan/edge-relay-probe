@@ -28,12 +28,13 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      # 主仓/第二仓 v1.2 因「多 job 共抢同一批免费代理、被超时误判耗尽」
-      # 从 5 降到 3。第三仓不同：claim_proxy 用 FOR UPDATE SKIP LOCKED
-      # 原子领取，跨 job/跨仓库不会取重（12 线程并发实测 12 个唯一出口）。
-      # 单 combo 内 WORKERS=5，即每个 combo 占 5 个号；池约 120 个，
-      # 6 并发 = 30 个号，留足探活剔除与轮换余量。
-      max-parallel: 6
+      # 2026-11-13 实测修正：4 并发（parallel-batch-2）中 3 个 job 在
+      # G2 34 省完备切分探测阶段就失败（count=620 / true_nf=0 /
+      # pages_ok=0），并非号不够，而是多 job 同时打探测请求把池质量
+      # 打穿。原子领取只保证不取重，不保证探测阶段拿得到有效响应。
+      # 单 combo 内 WORKERS=5；串行/低并发时 13-2025(86分)、
+      # 51-2025(48分) 均一次达标，故并发压到 2，稳字优先。
+      max-parallel: 2
       matrix:
         combo: ${{ fromJSON(inputs.combos) }}
     env:
