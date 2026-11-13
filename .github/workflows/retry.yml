@@ -62,44 +62,55 @@ jobs:
               print('非失败批次，跳过重派')
               raise SystemExit(0)
 
-          # 1) 解析 combo：优先用 job 名里的 matrix 值
-          combo = None
-          for j in get(f'/repos/{repo}/actions/runs/{rid}/jobs')['jobs']:
+          # 1) 解析本批次全部 combo，并挑出未成功的（并发批次可能部分失败）
+          jobs = get(f'/repos/{repo}/actions/runs/{rid}/jobs')['jobs']
+          all_combos, failed = [], []
+          for j in jobs:
               m = re.search(r'collect \(([0-9]{2}-[0-9]{4})\)', j['name'])
-              if m:
-                  combo = m.group(1)
-                  break
-          if not combo:
+              if not m:
+                  continue
+              c = m.group(1)
+              if c not in all_combos:
+                  all_combos.append(c)
+              if j.get('conclusion') != 'success' and c not in failed:
+                  failed.append(c)
+          targets = failed or all_combos
+          if not targets:
               m = re.search(r'([0-9]{2}-[0-9]{4})', title)
-              combo = m.group(1) if m else None
-          if not combo:
+              targets = [m.group(1)] if m else []
+          if not targets:
               print('::error::无法解析 combo，跳过重派')
               raise SystemExit(1)
-          print('解析到 combo:', combo)
+          print(f'本批次 combo={all_combos} | 需重派={targets}')
 
-          # 2) 主仓已达标则不重派，避免和别的通道重复
-          try:
-              get(f'/repos/EdisonFan/gk-collect/branches/special-{combo}')
-              print(f'主仓已有 special-{combo}，跳过重派')
+          # 2) 主仓已达标的从重派列表剔除，避免和别的通道重复
+          pending = []
+          for c in targets:
+              try:
+                  get(f'/repos/EdisonFan/gk-collect/branches/special-{c}')
+                  print(f'主仓已有 special-{c}，跳过')
+              except urllib.error.HTTPError as e:
+                  if e.code != 404:
+                      raise
+                  pending.append(c)
+          if not pending:
+              print('无需重派')
               raise SystemExit(0)
-          except urllib.error.HTTPError as e:
-              if e.code != 404:
-                  raise
 
-          # 3) 重试次数上限（tag 后缀 -rN，最多 2 次）
-          tag = title.replace('bench ', '', 1).strip() or f'auto-{combo}'
+          # 3) 重试次数上限（tag 后缀 -rN，整批共用，最多 2 次）
+          tag = title.replace('bench ', '', 1).strip() or 'auto-retry'
           m = re.search(r'-r(\d+)$', tag)
           n = int(m.group(1)) if m else 0
           base = re.sub(r'-r\d+$', '', tag)
           if n >= 2:
-              print(f'{combo} 已重派 {n} 次，达到上限，停止')
+              print(f'{pending} 已重派 {n} 次，达到上限，停止')
               raise SystemExit(0)
           new_tag = f'{base}-r{n + 1}'
 
-          # 4) 重派
+          # 4) 一次重派所有待重采 combo（bench.yml 的 max-parallel 控制并发度）
           body = json.dumps({
               'ref': 'main',
-              'inputs': {'combos': json.dumps([combo]), 'tag': new_tag},
+              'inputs': {'combos': json.dumps(pending), 'tag': new_tag},
           }).encode()
           req = urllib.request.Request(
               f'https://api.github.com/repos/{repo}/actions/workflows/bench.yml/dispatches',
@@ -107,5 +118,5 @@ jobs:
               headers={**h, 'Content-Type': 'application/json'},
               method='POST')
           with urllib.request.urlopen(req, timeout=30) as r:
-              print(f'重派 HTTP {r.status} | combo={combo} | tag={new_tag}')
+              print(f'重派 HTTP {r.status} | combos={pending} | tag={new_tag}')
           PY
