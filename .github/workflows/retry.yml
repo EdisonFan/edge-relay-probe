@@ -1,0 +1,111 @@
+name: Retry failed bench
+
+# bench 批次失败（闸门未过 / 无结果文件）时自动重派同一 combo。
+# 用 workflow_run 而不是在 bench.yml 里加 needs：GitHub 在 run 启动时
+# 锁定工作流定义，新增文件对本批次之后的完成事件立即生效。
+# 重派次数写进 tag 后缀 -rN，最多 2 次，防止无限循环。
+
+on:
+  workflow_run:
+    workflows: ["bench"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '指定 run id（手动验证用）'
+        required: true
+        type: string
+      force:
+        description: '忽略原批次结论强制走完检查（验证用，仍受次数上限约束）'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  retry:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 失败批次自动重派
+        env:
+          PAT: ${{ secrets.LAB_DISPATCH_TOKEN }}
+          RID: ${{ github.event.workflow_run.id || inputs.run_id }}
+          FORCE: ${{ inputs.force }}
+          EV: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request, urllib.error
+
+          pat  = os.environ['PAT']
+          rid  = os.environ['RID']
+          repo = os.environ['GITHUB_REPOSITORY']
+          force = os.environ.get('FORCE', 'false').lower() == 'true'
+          h = {'Authorization': 'Bearer ' + pat,
+               'Accept': 'application/vnd.github+json',
+               'User-Agent': 'gk-retry'}
+
+          def get(path):
+              req = urllib.request.Request('https://api.github.com' + path, headers=h)
+              return json.load(urllib.request.urlopen(req, timeout=30))
+
+          run = get(f'/repos/{repo}/actions/runs/{rid}')
+          title = run.get('display_title') or ''
+          concl = run.get('conclusion')
+          print(f'原 run {rid}: {title} | conclusion={concl} | event={os.environ["EV"]}')
+
+          if not force and concl != 'failure':
+              print('非失败批次，跳过重派')
+              raise SystemExit(0)
+
+          # 1) 解析 combo：优先用 job 名里的 matrix 值
+          combo = None
+          for j in get(f'/repos/{repo}/actions/runs/{rid}/jobs')['jobs']:
+              m = re.search(r'collect \(([0-9]{2}-[0-9]{4})\)', j['name'])
+              if m:
+                  combo = m.group(1)
+                  break
+          if not combo:
+              m = re.search(r'([0-9]{2}-[0-9]{4})', title)
+              combo = m.group(1) if m else None
+          if not combo:
+              print('::error::无法解析 combo，跳过重派')
+              raise SystemExit(1)
+          print('解析到 combo:', combo)
+
+          # 2) 主仓已达标则不重派，避免和别的通道重复
+          try:
+              get(f'/repos/EdisonFan/gk-collect/branches/special-{combo}')
+              print(f'主仓已有 special-{combo}，跳过重派')
+              raise SystemExit(0)
+          except urllib.error.HTTPError as e:
+              if e.code != 404:
+                  raise
+
+          # 3) 重试次数上限（tag 后缀 -rN，最多 2 次）
+          tag = title.replace('bench ', '', 1).strip() or f'auto-{combo}'
+          m = re.search(r'-r(\d+)$', tag)
+          n = int(m.group(1)) if m else 0
+          base = re.sub(r'-r\d+$', '', tag)
+          if n >= 2:
+              print(f'{combo} 已重派 {n} 次，达到上限，停止')
+              raise SystemExit(0)
+          new_tag = f'{base}-r{n + 1}'
+
+          # 4) 重派
+          body = json.dumps({
+              'ref': 'main',
+              'inputs': {'combos': json.dumps([combo]), 'tag': new_tag},
+          }).encode()
+          req = urllib.request.Request(
+              f'https://api.github.com/repos/{repo}/actions/workflows/bench.yml/dispatches',
+              data=body,
+              headers={**h, 'Content-Type': 'application/json'},
+              method='POST')
+          with urllib.request.urlopen(req, timeout=30) as r:
+              print(f'重派 HTTP {r.status} | combo={combo} | tag={new_tag}')
+          PY
