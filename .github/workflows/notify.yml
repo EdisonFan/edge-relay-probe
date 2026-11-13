@@ -44,3 +44,41 @@ jobs:
             exit 1
           fi
           echo "已派发主仓 sync-from-lab.yml"
+
+      # 接力：两个通道谁先跑完，谁接手剩下的 43-2024。
+      # 用主仓 refs/heads/relay-43-2024 的原子创建做互斥锁：
+      # 本地 supervise.sh 与这里抢同一个 ref，只有一方能建成功。
+      - name: 接力：谁先跑完谁接手 43-2024
+        if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+        shell: bash
+        env:
+          PAT: ${{ secrets.LAB_DISPATCH_TOKEN }}
+          TITLE: ${{ github.event.workflow_run.display_title }}
+        run: |
+          set -e
+          case "$TITLE" in
+            *43-2024*) echo "本批次即 43-2024，跳过接力（防自触发）"; exit 0 ;;
+          esac
+          [ -n "$PAT" ] || { echo "无 LAB_DISPATCH_TOKEN，跳过接力"; exit 0; }
+          HDR=(-H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json")
+          MAIN="EdisonFan/gk-collect"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "${HDR[@]}" \
+            "https://api.github.com/repos/$MAIN/branches/special-43-2024" || echo 000)
+          if [ "$CODE" = "200" ]; then
+            echo "主仓 special-43-2024 已达标，跳过接力"; exit 0
+          fi
+          SHA=$(curl -sS --max-time 30 "${HDR[@]}" \
+            "https://api.github.com/repos/$MAIN/git/ref/heads/main" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['object']['sha'])")
+          CLAIM=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST "${HDR[@]}" \
+            -d "{\"ref\":\"refs/heads/relay-43-2024\",\"sha\":\"$SHA\"}" \
+            "https://api.github.com/repos/$MAIN/git/refs" || echo 000)
+          if [ "$CLAIM" != "201" ]; then
+            echo "接力权已被本地通道抢占 (HTTP $CLAIM)，跳过"; exit 0
+          fi
+          echo "第三仓抢到接力权，派发 43-2024"
+          D=$(curl -sS -o /tmp/relay.json -w '%{http_code}' --max-time 30 -X POST "${HDR[@]}" \
+            -d '{"ref":"main","inputs":{"combos":"[\"43-2024\"]","tag":"relay-43-2024"}}' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/bench.yml/dispatches" || echo 000)
+          echo "派发 HTTP $D"
+          if [ "$D" != "204" ]; then cat /tmp/relay.json; exit 1; fi
