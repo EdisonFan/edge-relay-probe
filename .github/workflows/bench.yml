@@ -28,7 +28,12 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # 主仓/第二仓 v1.2 因「多 job 共抢同一批免费代理、被超时误判耗尽」
+      # 从 5 降到 3。第三仓不同：claim_proxy 用 FOR UPDATE SKIP LOCKED
+      # 原子领取，跨 job/跨仓库不会取重（12 线程并发实测 12 个唯一出口）。
+      # 单 combo 内 WORKERS=5，即每个 combo 占 5 个号；池约 120 个，
+      # 6 并发 = 30 个号，留足探活剔除与轮换余量。
+      max-parallel: 6
       matrix:
         combo: ${{ fromJSON(inputs.combos) }}
     env:
